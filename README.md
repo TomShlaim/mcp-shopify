@@ -10,10 +10,19 @@ pip install -r requirements.txt
 ```
 
 2. Set up environment variables:
-```bash
-export SHOPIFY_SHOP_URL="your-shop.myshopify.com"
-export SHOPIFY_ACCESS_TOKEN="your-access-token"
-```
+
+   Copy the `.env.example` file to create your own `.env` file:
+   ```bash
+   cp .env.example .env
+   ```
+   
+   Then edit the `.env` file with your Shopify credentials:
+   ```
+   SHOPIFY_SHOP_URL=your-store.myshopify.com
+   SHOPIFY_ACCESS_TOKEN=your_access_token_here
+   ```
+
+   The script will automatically load these environment variables using python-dotenv.
 
 ## Usage
 
