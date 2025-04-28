@@ -8,6 +8,8 @@ from typing_extensions import TypedDict
 from urllib.parse import urljoin, urlunparse
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
+import base64
+import mimetypes
 
 # Load environment variables
 load_dotenv()
@@ -59,7 +61,7 @@ class ProductMedia(TypedDict):
     src: str
     alt: Optional[str]
 
-def create_product(
+def create_shopify_product(
     shop_url: str,
     access_token: str,
     title: str,
@@ -381,9 +383,145 @@ def _create_metafields(
     if metafield_errors:
         raise ValueError(f"Metafield user errors: {json.dumps(metafield_errors, indent=2)}")
     
-    
+def upload_file_to_shopify(file_path: str, alt: str = None) -> dict:
+    """
+    Uploads a file to the Shopify store's Files section using the GraphQL Admin API.
+    Args:
+        file_path (str): Local path to the file.
+        alt (str, optional): Alt text for the file.
+    Returns:
+        dict: The fileCreate mutation response from Shopify.
+    """
+    filename = os.path.basename(file_path)
+    mime_type, _ = mimetypes.guess_type(file_path)
+    if not mime_type:
+        mime_type = "application/octet-stream"
+    is_image = mime_type.startswith("image/")
+    resource_type = "IMAGE" if is_image else "FILE"
+    content_type = "IMAGE" if is_image else "FILE"
+
+    # Debug output
+    print(f"[DEBUG] file_path: {file_path}")
+    print(f"[DEBUG] filename: {filename}")
+    print(f"[DEBUG] mime_type: {mime_type}")
+    print(f"[DEBUG] is_image: {is_image}")
+    print(f"[DEBUG] resource_type: {resource_type}")
+    print(f"[DEBUG] content_type: {content_type}")
+
+    # Step 1: Get staged upload parameters
+    mutation = """
+    mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+      stagedUploadsCreate(input: $input) {
+        stagedTargets {
+          url
+          resourceUrl
+          parameters {
+            name
+            value
+          }
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    variables = {
+        "input": [
+            {
+                "resource": resource_type,
+                "filename": filename,
+                "mimeType": mime_type,
+                "httpMethod": "POST"
+            }
+        ]
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": ACCESS_TOKEN
+    }
+    graphql_url = f"https://{SHOP_URL}/admin/api/2023-10/graphql.json"
+    resp = requests.post(graphql_url, json={"query": mutation, "variables": variables}, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    print(f"[DEBUG] stagedUploadsCreate response: {json.dumps(data, indent=2)}")
+    errors = data.get("data", {}).get("stagedUploadsCreate", {}).get("userErrors", [])
+    if errors:
+        raise Exception(f"Shopify stagedUploadsCreate error: {errors}")
+    staged = data["data"]["stagedUploadsCreate"]["stagedTargets"][0]
+    upload_url = staged["url"]
+    resource_url = staged["resourceUrl"]
+    params = {p["name"]: p["value"] for p in staged["parameters"]}
+
+    # Step 2: Upload the file to the staged URL (S3)
+    with open(file_path, "rb") as f:
+        files = {"file": (filename, f, mime_type)}
+        response = requests.post(upload_url, data=params, files=files)
+    if response.status_code not in (200, 201, 204):
+        raise Exception(f"Failed to upload file to staged URL: {response.text}")
+
+    # Step 3: Register the file in Shopify using fileCreate
+    mutation = """
+    mutation fileCreate($files: [FileCreateInput!]!) {
+      fileCreate(files: $files) {
+        files {
+          id
+          fileStatus
+          alt
+          createdAt
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    file_input = {
+        "originalSource": resource_url,
+        "contentType": content_type,
+        "filename": filename
+    }
+    if alt:
+        file_input["alt"] = alt
+    variables = {"files": [file_input]}
+    resp = requests.post(graphql_url, json={"query": mutation, "variables": variables}, headers=headers)
+    resp.raise_for_status()
+    return resp.json()
+
+def upload_theme_asset(theme_id: str, asset_key: str, file_path: str) -> dict:
+    """
+    Upload a file as a theme asset to Shopify using the REST Admin API.
+
+    Args:
+        theme_id (str): The ID of the theme to upload the asset to.
+        asset_key (str): The asset key/path in the theme (e.g., 'assets/test.png').
+        file_path (str): The local path to the file to upload.
+
+    Returns:
+        dict: The JSON response from Shopify.
+    """
+    with open(file_path, "rb") as file:
+        encoded_string = base64.b64encode(file.read()).decode("utf-8")
+
+    url = f"https://{SHOP_URL}/admin/api/2023-10/themes/{theme_id}/assets.json"
+    headers = {
+        "X-Shopify-Access-Token": ACCESS_TOKEN,
+        "Content-Type": "application/json"
+    }
+    data = {
+        "asset": {
+            "key": asset_key,
+            "attachment": encoded_string
+        }
+    }
+    response = requests.put(url, json=data, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
 @mcp.tool()
-def create_shopify_product(    
+def create_product(    
     title: str,
     descriptionHtml: Optional[str] = None,
     productType: Optional[str] = None,
@@ -398,7 +536,7 @@ def create_shopify_product(
     metafields: Optional[List[Dict[str, str]]] = None) -> str:
     debug_info = []
     try:        
-        result = create_product(
+        result = create_shopify_product(
             shop_url=SHOP_URL,
             access_token=ACCESS_TOKEN,
             title=title,
@@ -421,6 +559,39 @@ def create_shopify_product(
         error_msg = f"Error creating product: {str(e)}"
         debug_info.append(error_msg)
         return "\n".join(debug_info)
+    
+@mcp.tool()
+def upload_theme_asset_tool(theme_id: str, asset_key: str, file_path: str) -> str:
+    """
+    MCP tool: Upload a file as a theme asset to Shopify using the REST Admin API.
+    Args:
+        theme_id (str): The ID of the theme to upload the asset to.
+        asset_key (str): The asset key/path in the theme (e.g., 'assets/test.png').
+        file_path (str): The local path to the file to upload.
+    Returns:
+        str: The JSON response from Shopify as a string.
+    """
+    try:
+        result = upload_theme_asset(theme_id, asset_key, file_path)
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error uploading theme asset: {str(e)}"
+    
+@mcp.tool()
+def upload_file_to_shopify_tool(file_path: str, alt: str = None) -> str:
+    """
+    MCP tool: Upload a file to the Shopify store's Files section using the GraphQL Admin API.
+    Args:
+        file_path (str): Local path to the file.
+        alt (str, optional): Alt text for the file.
+    Returns:
+        str: The JSON response from Shopify as a string.
+    """
+    try:
+        result = upload_file_to_shopify(file_path, alt)
+        return json.dumps(result)   
+    except Exception as e:
+        return f"Error uploading file: {str(e)}"
 
 if __name__ == "__main__":
     mcp.run(transport='stdio')
